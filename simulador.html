@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Simulador de EDO</title>
+  
+  <style>
+    /* Reseteo básico para que ocupe toda la pantalla sin bordes blancos */
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background-color: #060912;
+      color: #e8f0fe;
+      font-family: 'Segoe UI', sans-serif;
+      overflow: hidden;
+    }
+    #root {
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+
+  <script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js" crossorigin></script>
+
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    // ── 1. Extraemos los hooks y componentes de las variables globales ──
+    const { useState, useCallback } = React;
+    const {
+      LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+      ResponsiveContainer, ScatterChart, Scatter
+    } = window.Recharts;
+
+    // ── Paleta ──────────────────────────────────────────
+    const C = {
+      bg:      "#060912",
+      surf:    "#0d1524",
+      surf2:   "#111d33",
+      border:  "#1e3054",
+      accent:  "#00e5ff",
+      accent2: "#ff6b35",
+      green:   "#00ff88",
+      yellow:  "#ffd700",
+      purple:  "#a855f7",
+      red:     "#ff4466",
+      dim:     "#6b89b0",
+      text:    "#e8f0fe",
+    };
+
+    // ── Presets generales ────────────────────────────────
+    const PRESETS = {
+      lotka:    { name:"Lotka-Volterra", icon:"🐺", eqX:"0.8*x - 0.04*x*y",    eqY:"0.02*x*y - 0.6*y",        x0:20,        y0:5,    t0:0, tf:40,  lx:"Presas x",       ly:"Depredadores y" },
+      vanderpol:{ name:"Van der Pol",    icon:"〜", eqX:"y",                    eqY:"2*(1-x*x)*y - x",          x0:2,         y0:0,    t0:0, tf:30,  lx:"Posición x",     ly:"Velocidad y"    },
+      lorentz:  { name:"Lorenz",         icon:"🌀", eqX:"10*(y - x)",            eqY:"x*(28 - y) - y",           x0:0.1,       y0:0,    t0:0, tf:20,  lx:"x(t)",           ly:"y(t)"           },
+      sir:      { name:"SIR Epidémico",  icon:"🦠", eqX:"-0.3*x*y",             eqY:"0.3*x*y - 0.05*y",         x0:0.99,      y0:0.01, t0:0, tf:100, lx:"Susceptibles S", ly:"Infectados I"   },
+      pendulo:  { name:"Péndulo",        icon:"🔵", eqX:"y",                    eqY:"-9.8*Math.sin(x)-0.1*y",  x0:Math.PI/3, y0:0,    t0:0, tf:20,  lx:"Ángulo θ",       ly:"Vel. angular ω" },
+      rlc:      { name:"Circuito RLC",   icon:"⚡", eqX:"y",                    eqY:"0",                         x0:0,         y0:0,    t0:0, tf:0.1, lx:"Carga q(t)",     ly:"Corriente i(t)" },
+      custom:   { name:"Personalizado",  icon:"✏️", eqX:"x - x*y",              eqY:"-y + x*y",                 x0:1,         y0:1,    t0:0, tf:20,  lx:"x(t)",           ly:"y(t)"           },
+    };
+
+    // ── Parámetros RLC por defecto ───────────────────────
+    const RLC_DEFAULTS = { R:10, L:0.1, C:0.001, V0:5, freq:60, srcType:"dc" };
+
+    // ── Métodos numéricos ────────────────────────────────
+    function makeF(ex, ey) {
+      return (t, x, y) => {
+        const fx = Function("t","x","y","Math", `"use strict";return (${ex})`)(t,x,y,Math);
+        const fy = Function("t","x","y","Math", `"use strict";return (${ey})`)(t,x,y,Math);
+        return [fx, fy];
+      };
+    }
+
+    function makeRLCf(R, L, Cap, V0, freq, srcType) {
+      return (t, q, i) => {
+        let Vs;
+        if      (srcType === "dc")   Vs = V0;
+        else if (srcType === "ac")   Vs = V0 * Math.sin(2 * Math.PI * freq * t);
+        else if (srcType === "step") Vs = t > 0 ? V0 : 0;
+        else if (srcType === "pulse")Vs = (Math.sin(2 * Math.PI * freq * t) > 0) ? V0 : 0;
+        else                         Vs = V0;
+        // dq/dt = i
+        // di/dt = (Vs - R*i - q/C) / L
+        const dq = i;
+        const di = (Vs - R * i - q / Cap) / L;
+        return [dq, di];
+      };
+    }
+
+    function solveRK4generic(f, x0, y0, t0, tf, h) {
+      const out = [];
+      let t=t0, x=x0, y=y0;
+      while (t <= tf + h*0.01) {
+        out.push({t, x, y});
+        const [k1x,k1y] = f(t,x,y);
+        const [k2x,k2y] = f(t+h/2, x+h/2*k1x, y+h/2*k1y);
+        const [k3x,k3y] = f(t+h/2, x+h/2*k2x, y+h/2*k2y);
+        const [k4x,k4y] = f(t+h,   x+h*k3x,   y+h*k3y);
+        x += h/6*(k1x+2*k2x+2*k3x+k4x);
+        y += h/6*(k1y+2*k2y+2*k3y+k4y);
+        t += h;
+        if (!isFinite(x)||!isFinite(y)) break;
+      }
+      return out;
+    }
+
+    function solveEuler(f, x0, y0, t0, tf, h) {
+      const out = [];
+      let t=t0, x=x0, y=y0;
+      while (t <= tf + h*0.01) {
+        out.push({t, x, y});
+        const [fx,fy] = f(t,x,y);
+        x += h*fx; y += h*fy; t += h;
+        if (!isFinite(x)||!isFinite(y)) break;
+      }
+      return out;
+    }
+
+    function solveHeun(f, x0, y0, t0, tf, h) {
+      const out = [];
+      let t=t0, x=x0, y=y0;
+      while (t <= tf + h*0.01) {
+        out.push({t, x, y});
+        const [k1x,k1y] = f(t,x,y);
+        const [k2x,k2y] = f(t+h, x+h*k1x, y+h*k1y);
+        x += h/2*(k1x+k2x); y += h/2*(k1y+k2y); t += h;
+        if (!isFinite(x)||!isFinite(y)) break;
+      }
+      return out;
+    }
+
+    function solveRK4(f, x0, y0, t0, tf, h) { return solveRK4generic(f,x0,y0,t0,tf,h); }
+
+    function solveAdams(f, x0, y0, t0, tf, h) {
+      const boot = solveRK4generic(f, x0, y0, t0, t0+2*h, h);
+      const out = [...boot];
+      let i = out.length - 1;
+      while (out[i].t <= tf + h*0.01) {
+        if (i < 2) { i++; continue; }
+        const {t,x,y} = out[i];
+        const [f0x,f0y] = f(out[i].t,   out[i].x,   out[i].y);
+        const [f1x,f1y] = f(out[i-1].t, out[i-1].x, out[i-1].y);
+        const [f2x,f2y] = f(out[i-2].t, out[i-2].x, out[i-2].y);
+        const nx = x + h/12*(23*f0x - 16*f1x + 5*f2x);
+        const ny = y + h/12*(23*f0y - 16*f1y + 5*f2y);
+        out.push({t: t+h, x: nx, y: ny});
+        i++;
+        if (!isFinite(nx)||!isFinite(ny)) break;
+      }
+      return out;
+    }
+
+    const SOLVERS = { euler:solveEuler, heun:solveHeun, rk4:solveRK4, adams:solveAdams };
+
+    const METHOD_LABELS = {
+      euler:"Euler Explícito — O(h)", heun:"Heun (Trapecio) — O(h²)",
+      rk4:"Runge-Kutta 4 — O(h⁴)",  adams:"Adams-Bashforth — O(h⁴)",
+    };
+    const METHOD_DESC = {
+      euler:"y_{n+1} = y_n + h·f(tₙ,yₙ)  |  Error O(h²)",
+      heun: "Predictor-corrector trapecio  |  Error O(h³)",
+      rk4:  "4 evaluaciones por paso  |  Error O(h⁵)  ✓",
+      adams:"Multipaso, arranca con RK4  |  Error O(h⁴)",
+    };
+
+    function sample(data, maxPts=800) {
+      if (data.length <= maxPts) return data;
+      const step = Math.ceil(data.length / maxPts);
+      return data.filter((_,i) => i % step === 0);
+    }
+
+    // ── RLC: régimen ─────────────────────────────────────
+    function rlcRegime(R, L, Cap) {
+      const disc = R*R - 4*L/Cap;
+      const alpha = R/(2*L);
+      const omega0 = 1/Math.sqrt(L*Cap);
+      const Q = (1/R)*Math.sqrt(L/Cap);
+      if      (disc < -1e-9) return { label:"Subamortiguado",  color:C.accent,  disc, alpha, omega0, Q };
+      else if (disc > 1e-9)  return { label:"Sobreamortiguado", color:C.red,    disc, alpha, omega0, Q };
+      else                   return { label:"Amortiguamiento Crítico", color:C.yellow, disc, alpha, omega0, Q };
+    }
+
+    // ── Auto paso RLC ─────────────────────────────────────
+    function rlcAutoH(L, Cap) {
+      const T = 2 * Math.PI * Math.sqrt(L * Cap);
+      return Math.max(T / 500, 1e-7);
+    }
+    function rlcAutoTf(R, L, Cap, srcType, freq) {
+      if (srcType === "ac" || srcType === "pulse") return Math.max(5/freq, 0.05);
+      const tau = 2*L/R;
+      return Math.max(tau * 8, 0.01);
+    }
+
+    // ── Tooltips ─────────────────────────────────────────
+    const CustomTip = ({ active, payload, lx, ly, isRLC }) => {
+      if (!active || !payload?.length) return null;
+      return (
+        <div style={{background:C.surf2, border:`1px solid ${C.border}`, borderRadius:8, padding:"8px 12px", fontFamily:"monospace", fontSize:11}}>
+          {payload.map((p,i) => (
+            <div key={i} style={{color:p.color, marginBottom:2}}>
+              {i===0 ? lx : ly}: <strong>{Number(p.value).toFixed(5)}</strong>{i===0&&isRLC?" C":" "}
+            </div>
+          ))}
+          <div style={{color:C.dim, marginTop:4}}>t = {Number(payload[0]?.payload?.t??0).toFixed(5)} s</div>
+        </div>
+      );
+    };
+    
+    const PhaseTip = ({ active, payload, lx, ly }) => {
+      if (!active || !payload?.length) return null;
+      const d = payload[0]?.payload;
+      if (!d) return null;
+      return (
+        <div style={{background:C.surf2, border:`1px solid ${C.border}`, borderRadius:8, padding:"8px 12px", fontFamily:"monospace", fontSize:11}}>
+          <div style={{color:C.accent}}>{lx}: {Number(d.x).toFixed(5)}</div>
+          <div style={{color:C.accent2}}>{ly}: {Number(d.y).toFixed(5)}</div>
+          <div style={{color:C.dim, marginTop:4}}>t = {Number(d.t).toFixed(5)}</div>
+        </div>
+      );
+    };
+
+    // ── Diagrama SVG del circuito RLC ────────────────────
+    function RLCDiagram({ R, L, Cap, srcType }) {
+      const srcLabel = { dc:"V DC", ac:"V AC", step:"Escalón", pulse:"Pulso" }[srcType] || "V";
+      return (
+        <svg viewBox="0 0 260 130" style={{width:"100%", maxHeight:100, display:"block"}}>
+          {/* Fondo */}
+          <rect x="0" y="0" width="260" height="130" rx="8" fill={C.bg} opacity="0.6"/>
+
+          {/* Cables */}
+          <line x1="30" y1="30" x2="60" y2="30" stroke={C.accent} strokeWidth="1.5"/>
+          <line x1="100" y1="30" x2="130" y2="30" stroke={C.accent} strokeWidth="1.5"/>
+          <line x1="170" y1="30" x2="200" y2="30" stroke={C.accent} strokeWidth="1.5"/>
+          <line x1="230" y1="30" x2="240" y2="30" stroke={C.accent} strokeWidth="1.5"/>
+          <line x1="240" y1="30" x2="240" y2="100" stroke={C.accent} strokeWidth="1.5"/>
+          <line x1="10" y1="100" x2="240" y2="100" stroke={C.accent} strokeWidth="1.5"/>
+          <line x1="10" y1="30" x2="10" y2="100" stroke={C.accent} strokeWidth="1.5"/>
+
+          {/* Fuente */}
+          <circle cx="20" cy="65" r="12" fill="none" stroke={C.yellow} strokeWidth="1.5"/>
+          <line x1="20" y1="30" x2="20" y2="53" stroke={C.accent} strokeWidth="1.5"/>
+          <line x1="20" y1="77" x2="20" y2="100" stroke={C.accent} strokeWidth="1.5"/>
+          <text x="20" y="69" textAnchor="middle" fill={C.yellow} fontSize="7" fontFamily="monospace">{srcLabel}</text>
+
+          {/* R */}
+          <rect x="60" y="22" width="40" height="16" rx="3" fill={C.surf2} stroke={C.accent2} strokeWidth="1.5"/>
+          <text x="80" y="33" textAnchor="middle" fill={C.accent2} fontSize="8" fontFamily="monospace">R</text>
+          <text x="80" y="52" textAnchor="middle" fill={C.dim} fontSize="7" fontFamily="monospace">{R}Ω</text>
+
+          {/* L */}
+          <rect x="130" y="22" width="40" height="16" rx="3" fill={C.surf2} stroke={C.purple} strokeWidth="1.5"/>
+          <text x="150" y="33" textAnchor="middle" fill={C.purple} fontSize="8" fontFamily="monospace">L</text>
+          <text x="150" y="52" textAnchor="middle" fill={C.dim} fontSize="7" fontFamily="monospace">{L}H</text>
+
+          {/* C */}
+          <line x1="200" y1="20" x2="200" y2="40" stroke={C.green} strokeWidth="1.5"/>
+          <line x1="230" y1="20" x2="230" y2="40" stroke={C.green} strokeWidth="1.5"/>
+          <line x1="200" y1="30" x2="200" y2="30" stroke={C.accent} strokeWidth="1.5"/>
+          <line x1="230" y1="30" x2="230" y2="30" stroke={C.accent} strokeWidth="1.5"/>
+          <text x="215" y="55" textAnchor="middle" fill={C.green} fontSize="8" fontFamily="monospace">C</text>
+          <text x="215" y="65" textAnchor="middle" fill={C.dim} fontSize="7" fontFamily="monospace">{Cap*1000}mF</text>
+
+          {/* Flecha corriente */}
+          <text x="130" y="115" textAnchor="middle" fill={C.dim} fontSize="7" fontFamily="monospace">→ i(t)</text>
+        </svg>
+      );
+    }
+
+    // ════════════════════════════════════════════════════
+    // COMPONENTE PRINCIPAL
+    // ════════════════════════════════════════════════════
+    function SimEDO() {
+      const [preset, setPreset] = useState("lotka");
+      const [eqX,    setEqX]   = useState(PRESETS.lotka.eqX);
+      const [eqY,    setEqY]   = useState(PRESETS.lotka.eqY);
+      const [x0,     setX0]    = useState(PRESETS.lotka.x0);
+      const [y0,     setY0]    = useState(PRESETS.lotka.y0);
+      const [t0,     setT0]    = useState(PRESETS.lotka.t0);
+      const [tf,     setTf]    = useState(PRESETS.lotka.tf);
+      const [hExp,   setHExp]  = useState(-2);
+      const [method, setMethod]= useState("rk4");
+      const [view,   setView]  = useState("time");
+      const [sol,    setSol]   = useState(null);
+      const [labels, setLabels]= useState({lx:PRESETS.lotka.lx, ly:PRESETS.lotka.ly});
+      const [error,  setError] = useState("");
+      const [stats,  setStats] = useState(null);
+      const [running,setRunning]=useState(false);
+
+      // RLC specific state
+      const [rlcR,   setRlcR]     = useState(RLC_DEFAULTS.R);
+      const [rlcL,   setRlcL]     = useState(RLC_DEFAULTS.L);
+      const [rlcC,   setRlcC]     = useState(RLC_DEFAULTS.C);
+      const [rlcV0,  setRlcV0]    = useState(RLC_DEFAULTS.V0);
+      const [rlcFreq,setRlcFreq]  = useState(RLC_DEFAULTS.freq);
+      const [rlcSrc, setRlcSrc]   = useState(RLC_DEFAULTS.srcType);
+      const [rlcView,setRlcView]  = useState("qi");  // "qi" | "power" | "phase"
+
+      const isRLC = preset === "rlc";
+      const h = Math.pow(10, hExp);
+
+      // Régimen RLC calculado
+      const regime = rlcRegime(rlcR, rlcL, rlcC);
+
+      // ── Cargar preset ────────────────────────────────
+      const loadPreset = (key) => {
+        const p = PRESETS[key];
+        setPreset(key);
+        setLabels({lx:p.lx, ly:p.ly});
+        setError(""); setSol(null); setStats(null);
+        if (key === "rlc") {
+          setX0(0); setY0(0); setT0(0);
+          const autoTf = rlcAutoTf(rlcR, rlcL, rlcC, rlcSrc, rlcFreq);
+          setTf(parseFloat(autoTf.toFixed(4)));
+          const autoH  = rlcAutoH(rlcL, rlcC);
+          const expVal = Math.log10(autoH);
+          setHExp(Math.max(-4, Math.min(-1, parseFloat(expVal.toFixed(2)))));
+        } else {
+          setEqX(p.eqX); setEqY(p.eqY);
+          setX0(p.x0); setY0(p.y0); setT0(p.t0); setTf(p.tf);
+        }
+      };
+
+      // ── Simular ──────────────────────────────────────
+      const simulate = useCallback(() => {
+        setError(""); setRunning(true);
+        try {
+          let f, x0v = Number(x0), y0v = Number(y0), t0v = Number(t0), tfv = Number(tf), hv = h;
+
+          if (isRLC) {
+            const R=Number(rlcR), L=Number(rlcL), Cap=Number(rlcC),
+                  V0=Number(rlcV0), freq=Number(rlcFreq);
+            hv = rlcAutoH(L, Cap);
+            tfv = rlcAutoTf(R, L, Cap, rlcSrc, freq);
+            f = makeRLCf(R, L, Cap, V0, freq, rlcSrc);
+            x0v=0; y0v=0;
+          } else {
+            f = makeF(eqX, eqY);
+            f(t0v, x0v, y0v); // test parse
+          }
+
+          const t1 = performance.now();
+          const raw = SOLVERS[method](f, x0v, y0v, Number(t0), tfv, hv);
+          const elapsed = performance.now() - t1;
+
+          // Para RLC añadimos energía al dataset
+          let finalData = raw;
+          if (isRLC) {
+            const R=Number(rlcR), L=Number(rlcL), Cap=Number(rlcC), V0=Number(rlcV0), freq=Number(rlcFreq);
+            finalData = raw.map(d => {
+              const Vc = d.x / Cap;
+              let Vs;
+              if      (rlcSrc==="dc")    Vs = V0;
+              else if (rlcSrc==="ac")    Vs = V0*Math.sin(2*Math.PI*freq*d.t);
+              else if (rlcSrc==="step")  Vs = d.t>0?V0:0;
+              else                        Vs = Math.sin(2*Math.PI*freq*d.t)>0?V0:0;
+              const Vr = d.y * R;
+              const Vl = Vs - Vc - Vr;
+              const eL = 0.5*L*d.y*d.y;
+              const eC = 0.5*d.x*d.x/Cap;
+              const p  = d.y*(Vs - Vr); // potencia entregada
+              return { ...d, Vc, Vr, Vl, Vs, eL, eC, pTotal: eL+eC, power: p };
+            });
+          }
+
+          setSol(finalData);
+          setStats({
+            steps: raw.length,
+            ms: elapsed.toFixed(1),
+            maxX: Math.max(...raw.map(d=>Math.abs(d.x))).toExponential(2),
+            maxY: Math.max(...raw.map(d=>Math.abs(d.y))).toExponential(2),
+          });
+        } catch(e) {
+          setError("⚠ " + e.message);
+        }
+        setRunning(false);
+      }, [eqX, eqY, x0, y0, t0, tf, h, method, isRLC, rlcR, rlcL, rlcC, rlcV0, rlcFreq, rlcSrc]);
+
+      const timeSeries  = sol ? sample(sol) : [];
+      const phaseData   = sol ? sample(sol, 1200) : [];
+
+      // ── Estilos ──────────────────────────────────────
+      const s = {
+        root:      { display:"flex", flexDirection:"column", height:"100vh", background:C.bg, color:C.text, fontFamily:"'Segoe UI',sans-serif", overflow:"hidden" },
+        header:    { display:"flex", alignItems:"center", gap:12, padding:"8px 18px", borderBottom:`1px solid ${C.border}`, background:"rgba(6,9,18,0.95)", flexShrink:0 },
+        logoBox:   { width:34, height:34, border:`2px solid ${C.accent}`, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:16, color:C.accent, boxShadow:`0 0 14px ${C.accent}44` },
+        logoText:  { fontSize:"1.2rem", fontWeight:800 },
+        body:      { display:"flex", flex:1, overflow:"hidden" },
+        sidebar:   { width:320, background:C.surf, borderRight:`1px solid ${C.border}`, overflowY:"auto", padding:12, display:"flex", flexDirection:"column", gap:12, flexShrink:0 },
+        secTitle:  { fontSize:"0.58rem", fontWeight:700, letterSpacing:"0.14em", textTransform:"uppercase", color:C.dim, fontFamily:"monospace", marginBottom:5 },
+        presetGrid:{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:5 },
+        pBtn:      (a) => ({ background:a?`rgba(0,229,255,0.1)`:C.surf2, border:`1px solid ${a?C.accent:C.border}`, color:C.text, padding:"6px 5px", borderRadius:7, cursor:"pointer", fontSize:"0.65rem", fontWeight:600, textAlign:"center", transition:"all .15s" }),
+        eqPanel:   { background:C.surf2, border:`1px solid ${C.border}`, borderRadius:10, padding:10 },
+        eqRow:     { display:"flex", alignItems:"center", gap:7, marginBottom:6 },
+        eqLabel:   { fontFamily:"monospace", fontSize:"0.72rem", color:C.accent, minWidth:55, whiteSpace:"nowrap" },
+        inp:       { flex:1, background:C.bg, border:`1px solid ${C.border}`, color:C.text, padding:"4px 7px", borderRadius:6, fontFamily:"monospace", fontSize:"0.75rem", outline:"none", width:"100%", boxSizing:"border-box" },
+        methodGrid:{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:3, background:C.bg, border:`1px solid ${C.border}`, borderRadius:8, padding:3 },
+        mBtn:      (a) => ({ padding:"5px 2px", border:"none", background:a?C.accent:"transparent", color:a?C.bg:C.dim, cursor:"pointer", borderRadius:6, fontFamily:"monospace", fontSize:"0.6rem", fontWeight:a?700:400, textAlign:"center", lineHeight:1.3, transition:"all .15s" }),
+        runBtn:    { width:"100%", padding:"10px", background:`linear-gradient(135deg,${C.accent},#0099cc)`, border:"none", borderRadius:9, color:C.bg, fontFamily:"inherit", fontSize:"0.95rem", fontWeight:800, cursor:"pointer", letterSpacing:"0.05em", transition:"all .2s" },
+        statGrid:  { display:"grid", gridTemplateColumns:"1fr 1fr", gap:5 },
+        statCard:  { background:C.bg, border:`1px solid ${C.border}`, borderRadius:7, padding:"6px 9px" },
+        canvasArea:{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" },
+        toolbar:   { display:"flex", alignItems:"center", gap:8, padding:"7px 14px", borderBottom:`1px solid ${C.border}`, background:"rgba(13,21,36,0.95)", flexShrink:0, flexWrap:"wrap" },
+        viewTabs:  { display:"flex", gap:3, background:C.bg, border:`1px solid ${C.border}`, borderRadius:7, padding:3 },
+        vTab:      (a) => ({ padding:"3px 10px", border:"none", background:a?"#7c3aed":"transparent", color:a?"#fff":C.dim, cursor:"pointer", borderRadius:5, fontFamily:"inherit", fontSize:"0.68rem", fontWeight:600, transition:"all .15s" }),
+        chartWrap: { flex:1, overflow:"hidden", display:"flex", flexDirection:"column" },
+        infoBar:   { display:"flex", gap:14, alignItems:"center", padding:"5px 14px", borderTop:`1px solid ${C.border}`, background:"rgba(13,21,36,0.95)", fontFamily:"monospace", fontSize:"0.65rem", color:C.dim, flexShrink:0 },
+        errBox:    { background:"rgba(255,68,102,0.12)", border:`1px solid ${C.red}`, borderRadius:7, padding:"6px 9px", fontFamily:"monospace", fontSize:"0.68rem", color:C.red },
+        mInfo:     { background:C.bg, border:`1px solid ${C.border}`, borderRadius:7, padding:"7px 9px", fontFamily:"monospace", fontSize:"0.65rem", color:C.dim, lineHeight:1.7 },
+        rlcPanel:  { background:C.surf2, border:`1px solid ${C.accent}22`, borderRadius:10, padding:10 },
+        rlcRow:    { display:"flex", alignItems:"center", gap:6, marginBottom:6 },
+        rlcLabel:  { fontFamily:"monospace", fontSize:"0.7rem", color:C.dim, minWidth:42 },
+        numInp:    { width:"100%", boxSizing:"border-box", background:C.bg, border:`1px solid ${C.border}`, color:C.text, padding:"3px 6px", borderRadius:6, fontFamily:"monospace", fontSize:"0.72rem", outline:"none" },
+        srcBtn:    (a,col) => ({ flex:1, padding:"4px 0", border:`1px solid ${a?col:C.border}`, background:a?`${col}22`:"transparent", color:a?col:C.dim, cursor:"pointer", borderRadius:6, fontFamily:"monospace", fontSize:"0.62rem", fontWeight:a?700:400, transition:"all .15s" }),
+        regBadge:  (col) => ({ display:"inline-block", padding:"3px 8px", borderRadius:5, border:`1px solid ${col}`, color:col, fontFamily:"monospace", fontSize:"0.65rem", fontWeight:700, background:`${col}15` }),
+      };
+
+      const axisStyle = { fill:C.dim, fontSize:10, fontFamily:"monospace" };
+      const gridStyle = { stroke:C.border, strokeDasharray:"3 3", opacity:0.5 };
+
+      const LegendRow = () => (
+        <div style={{display:"flex", gap:14, alignItems:"center", marginLeft:"auto"}}>
+          {isRLC ? (
+            <>
+              <span style={{display:"flex",alignItems:"center",gap:4,fontSize:"0.65rem",color:C.dim,fontFamily:"monospace"}}>
+                <span style={{width:16,height:2,background:C.accent,display:"inline-block"}}/> q(t) carga
+              </span>
+              <span style={{display:"flex",alignItems:"center",gap:4,fontSize:"0.65rem",color:C.dim,fontFamily:"monospace"}}>
+                <span style={{width:16,height:2,background:C.accent2,display:"inline-block"}}/> i(t) corriente
+              </span>
+            </>
+          ) : (
+            <>
+              <span style={{display:"flex",alignItems:"center",gap:4,fontSize:"0.65rem",color:C.dim,fontFamily:"monospace"}}>
+                <span style={{width:16,height:2,background:C.accent,display:"inline-block"}}/> {labels.lx}
+              </span>
+              <span style={{display:"flex",alignItems:"center",gap:4,fontSize:"0.65rem",color:C.dim,fontFamily:"monospace"}}>
+                <span style={{width:16,height:2,background:C.accent2,display:"inline-block"}}/> {labels.ly}
+              </span>
+            </>
+          )}
+        </div>
+      );
+
+      // ── Vista de gráficas RLC ─────────────────────────
+      const RLCCharts = () => {
+        if (!sol) return null;
+        const ts = sample(sol, 900);
+
+        if (rlcView === "qi") return (
+          <div style={{flex:1, padding:"10px 6px 2px"}}>
+            <div style={{fontFamily:"monospace",fontSize:"0.6rem",color:C.dim,paddingLeft:8,marginBottom:3}}>
+              CARGA q(t) [C] · CORRIENTE i(t) [A] · TENSIÓN Vc(t) [V]
+            </div>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={ts}>
+                <CartesianGrid {...gridStyle}/>
+                <XAxis dataKey="t" stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toExponential(1)}
+                  label={{value:"t (s)", position:"insideBottomRight", fill:C.dim, fontSize:10, offset:-5}}/>
+                <YAxis stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toExponential(1)} width={60}/>
+                <Tooltip content={<CustomTip lx="q(t)" ly="i(t)" isRLC={true}/>}/>
+                <Line type="monotone" dataKey="x"  stroke={C.accent}  dot={false} strokeWidth={2} name="q(t) [C]"/>
+                <Line type="monotone" dataKey="y"  stroke={C.accent2} dot={false} strokeWidth={2} name="i(t) [A]"/>
+                <Line type="monotone" dataKey="Vc" stroke={C.green}   dot={false} strokeWidth={1.5} strokeDasharray="4 2" name="Vc [V]"/>
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        );
+
+        if (rlcView === "voltages") return (
+          <div style={{flex:1, padding:"10px 6px 2px"}}>
+            <div style={{fontFamily:"monospace",fontSize:"0.6rem",color:C.dim,paddingLeft:8,marginBottom:3}}>
+              VOLTAJES: Vs(t) · Vr(t) · Vl(t) · Vc(t)
+            </div>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={ts}>
+                <CartesianGrid {...gridStyle}/>
+                <XAxis dataKey="t" stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toExponential(1)}
+                  label={{value:"t (s)", position:"insideBottomRight", fill:C.dim, fontSize:10, offset:-5}}/>
+                <YAxis stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toFixed(2)} width={55}/>
+                <Tooltip contentStyle={{background:C.surf2,border:`1px solid ${C.border}`,fontSize:10,fontFamily:"monospace"}}/>
+                <Line type="monotone" dataKey="Vs" stroke={C.yellow}  dot={false} strokeWidth={2}   name="Vs [V]"/>
+                <Line type="monotone" dataKey="Vc" stroke={C.green}   dot={false} strokeWidth={2}   name="Vc [V]"/>
+                <Line type="monotone" dataKey="Vr" stroke={C.accent2} dot={false} strokeWidth={1.5} name="Vr [V]"/>
+                <Line type="monotone" dataKey="Vl" stroke={C.purple}  dot={false} strokeWidth={1.5} name="Vl [V]"/>
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        );
+
+        if (rlcView === "energy") return (
+          <div style={{flex:1, padding:"10px 6px 2px"}}>
+            <div style={{fontFamily:"monospace",fontSize:"0.6rem",color:C.dim,paddingLeft:8,marginBottom:3}}>
+              ENERGÍA: Inductor eL = ½Li² · Capacitor eC = q²/2C · Total
+            </div>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={ts}>
+                <CartesianGrid {...gridStyle}/>
+                <XAxis dataKey="t" stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toExponential(1)}
+                  label={{value:"t (s)", position:"insideBottomRight", fill:C.dim, fontSize:10, offset:-5}}/>
+                <YAxis stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toExponential(1)} width={60}/>
+                <Tooltip contentStyle={{background:C.surf2,border:`1px solid ${C.border}`,fontSize:10,fontFamily:"monospace"}}/>
+                <Line type="monotone" dataKey="eL"     stroke={C.purple} dot={false} strokeWidth={2}   name="eL [J] Inductor"/>
+                <Line type="monotone" dataKey="eC"     stroke={C.green}  dot={false} strokeWidth={2}   name="eC [J] Capacitor"/>
+                <Line type="monotone" dataKey="pTotal" stroke={C.yellow} dot={false} strokeWidth={1.5} strokeDasharray="4 2" name="E total [J]"/>
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        );
+
+        if (rlcView === "phase") return (
+          <div style={{flex:1, padding:"10px 6px 2px"}}>
+            <div style={{fontFamily:"monospace",fontSize:"0.6rem",color:C.dim,paddingLeft:8,marginBottom:3}}>
+              RETRATO DE FASE: q(t) vs i(t)
+            </div>
+            <ResponsiveContainer width="100%" height="100%">
+              <ScatterChart>
+                <CartesianGrid {...gridStyle}/>
+                <XAxis dataKey="x" type="number" name="q(t)" stroke={C.border} tick={axisStyle}
+                  tickFormatter={v=>Number(v).toExponential(1)} label={{value:"q [C]",position:"insideBottom",fill:C.dim,fontSize:10}}/>
+                <YAxis dataKey="y" type="number" name="i(t)" stroke={C.border} tick={axisStyle}
+                  tickFormatter={v=>Number(v).toExponential(1)} width={55} label={{value:"i [A]",angle:-90,position:"insideLeft",fill:C.dim,fontSize:10}}/>
+                <Tooltip content={<PhaseTip lx="q(t)" ly="i(t)"/>}/>
+                <Scatter data={sample(sol,1200)} fill={C.accent} opacity={0.65}/>
+              </ScatterChart>
+            </ResponsiveContainer>
+          </div>
+        );
+        return null;
+      };
+
+      // ── Render ────────────────────────────────────────
+      return (
+        <div style={s.root}>
+          {/* HEADER */}
+          <header style={s.header}>
+            <div style={s.logoBox}>∂</div>
+            <div style={s.logoText}>Sim<span style={{color:C.accent}}>EDO</span></div>
+            <div style={{marginLeft:6, fontSize:"0.68rem", color:C.dim, fontFamily:"monospace"}}>
+              Simulador de Ecuaciones Diferenciales Ordinarias
+            </div>
+            <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:6}}>
+              <div style={{width:7,height:7,borderRadius:"50%",background:C.green,boxShadow:`0 0 6px ${C.green}`}}/>
+              <span style={{fontFamily:"monospace",fontSize:"0.65rem",color:C.dim}}>listo</span>
+            </div>
+          </header>
+
+          <div style={s.body}>
+            {/* SIDEBAR */}
+            <aside style={s.sidebar}>
+
+              {/* Presets */}
+              <div>
+                <div style={s.secTitle}>⚡ Sistemas predefinidos</div>
+                <div style={s.presetGrid}>
+                  {Object.entries(PRESETS).map(([k,p]) => (
+                    <button key={k} style={s.pBtn(preset===k)} onClick={() => loadPreset(k)}>
+                      <div style={{fontSize:"1rem",marginBottom:1}}>{p.icon}</div>
+                      <div style={{fontSize:"0.6rem",lineHeight:1.2}}>{p.name}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Panel RLC */}
+              {isRLC ? (
+                <div>
+                  <div style={s.secTitle}>⚡ Parámetros del circuito RLC</div>
+                  <div style={s.rlcPanel}>
+                    {/* Diagrama */}
+                    <RLCDiagram R={rlcR} L={rlcL} Cap={rlcC} srcType={rlcSrc}/>
+
+                    {/* Régimen */}
+                    <div style={{marginBottom:8,marginTop:4}}>
+                      <div style={s.secTitle}>Régimen</div>
+                      <span style={s.regBadge(regime.color)}>{regime.label}</span>
+                      <div style={{fontFamily:"monospace",fontSize:"0.62rem",color:C.dim,marginTop:4,lineHeight:1.6}}>
+                        α = {regime.alpha.toFixed(1)} s⁻¹ &nbsp;|&nbsp; ω₀ = {regime.omega0.toFixed(1)} rad/s<br/>
+                        Q = {regime.Q.toFixed(2)} &nbsp;|&nbsp; Δ = {regime.disc.toExponential(2)}
+                      </div>
+                    </div>
+
+                    {/* Parámetros */}
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:8}}>
+                      {[
+                        ["R (Ω)", rlcR, setRlcR, C.accent2],
+                        ["L (H)", rlcL, setRlcL, C.purple],
+                        ["C (F)", rlcC, setRlcC, C.green],
+                        ["V₀ (V)", rlcV0, setRlcV0, C.yellow],
+                      ].map(([lbl,val,set,col]) => (
+                        <div key={lbl}>
+                          <div style={{...s.secTitle, marginBottom:2, color:col}}>{lbl}</div>
+                          <input type="number" step="any" style={{...s.numInp, borderColor:col+"44"}}
+                            value={val} onChange={e => set(e.target.value)}/>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Fuente */}
+                    <div style={s.secTitle}>Fuente de voltaje</div>
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,marginBottom:6}}>
+                      {[["dc","⎓ DC",C.yellow],["ac","∿ AC",C.accent],["step","▲ Escalón",C.green],["pulse","⊓ Pulso",C.purple]].map(([k,lbl,col]) => (
+                        <button key={k} style={s.srcBtn(rlcSrc===k,col)} onClick={() => setRlcSrc(k)}>{lbl}</button>
+                      ))}
+                    </div>
+                    {(rlcSrc==="ac"||rlcSrc==="pulse") && (
+                      <div style={s.rlcRow}>
+                        <span style={s.rlcLabel}>Freq (Hz)</span>
+                        <input type="number" step="any" style={s.numInp} value={rlcFreq} onChange={e=>setRlcFreq(e.target.value)}/>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Vista RLC */}
+                  <div style={s.secTitle}>Vista de gráficas RLC</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
+                    {[["qi","q·i·Vc"],["voltages","Voltajes"],["energy","Energía"],["phase","Fase"]].map(([k,lbl]) => (
+                      <button key={k} style={s.srcBtn(rlcView===k, C.accent)} onClick={() => setRlcView(k)}>{lbl}</button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                /* Ecuaciones generales */
+                <div>
+                  <div style={s.secTitle}>📐 Ecuaciones</div>
+                  <div style={s.eqPanel}>
+                    <div style={s.eqRow}>
+                      <span style={s.eqLabel}>dx/dt =</span>
+                      <input style={s.inp} value={eqX} onChange={e=>setEqX(e.target.value)} placeholder="f(t,x,y)"/>
+                    </div>
+                    <div style={s.eqRow}>
+                      <span style={s.eqLabel}>dy/dt =</span>
+                      <input style={s.inp} value={eqY} onChange={e=>setEqY(e.target.value)} placeholder="g(t,x,y)"/>
+                    </div>
+                    <div style={s.eqRow}>
+                      <span style={{...s.eqLabel, color:C.accent2}}>x(t₀) =</span>
+                      <input style={s.inp} value={x0} onChange={e=>setX0(e.target.value)}/>
+                    </div>
+                    <div style={{...s.eqRow, marginBottom:0}}>
+                      <span style={{...s.eqLabel, color:C.accent2}}>y(t₀) =</span>
+                      <input style={s.inp} value={y0} onChange={e=>setY0(e.target.value)}/>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Parámetros tiempo (solo para no-RLC) */}
+              {!isRLC && (
+                <div>
+                  <div style={s.secTitle}>⚙️ Intervalo de tiempo</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:8}}>
+                    {[["t₀",t0,setT0],["tf",tf,setTf]].map(([lbl,val,set]) => (
+                      <div key={lbl}>
+                        <div style={{...s.secTitle,marginBottom:2}}>{lbl}</div>
+                        <input style={{...s.inp,flex:"none"}} value={val} onChange={e=>set(e.target.value)}/>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={s.secTitle}>Paso h = {h.toPrecision(2)}</div>
+                  <input type="range" min={-4} max={-1} step={0.25} value={hExp}
+                    onChange={e=>setHExp(Number(e.target.value))} style={{width:"100%",accentColor:C.accent}}/>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:"0.58rem",color:C.dim,fontFamily:"monospace",marginTop:2}}>
+                    <span>0.0001</span><span>0.001</span><span>0.01</span><span>0.1</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Método */}
+              <div>
+                <div style={s.secTitle}>🧮 Método numérico</div>
+                <div style={s.methodGrid}>
+                  {[["euler","Euler\nExp."],["heun","Heun\nTrap."],["rk4","RK4\nOrd.4"],["adams","Adams\nBash."]].map(([k,lbl]) => (
+                    <button key={k} style={s.mBtn(method===k)} onClick={() => setMethod(k)}>
+                      {lbl.split("\n").map((l,i) => <span key={i} style={{display:"block"}}>{l}</span>)}
+                    </button>
+                  ))}
+                </div>
+                <div style={{...s.mInfo,marginTop:6}}>
+                  <span style={{color:C.accent,fontWeight:700}}>{METHOD_LABELS[method]}</span><br/>
+                  {METHOD_DESC[method]}
+                </div>
+              </div>
+
+              {error && <div style={s.errBox}>{error}</div>}
+
+              <button style={s.runBtn} onClick={simulate}>
+                {running ? "⏳ CALCULANDO..." : "▶  SIMULAR"}
+              </button>
+
+              {stats && (
+                <div>
+                  <div style={s.secTitle}>📊 Estadísticas</div>
+                  <div style={s.statGrid}>
+                    {[["Pasos",stats.steps.toLocaleString()],["CPU",stats.ms+"ms"],
+                      [isRLC?"Max q":"Max |x|",stats.maxX],[isRLC?"Max i":"Max |y|",stats.maxY]].map(([l,v]) => (
+                      <div key={l} style={s.statCard}>
+                        <div style={{fontSize:"0.56rem",color:C.dim,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.07em"}}>{l}</div>
+                        <div style={{fontSize:"0.9rem",fontWeight:700,color:C.accent,fontFamily:"monospace"}}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </aside>
+
+            {/* ÁREA DE GRÁFICAS */}
+            <div style={s.canvasArea}>
+              <div style={s.toolbar}>
+                {!isRLC && (
+                  <div style={s.viewTabs}>
+                    {[["time","Serie temporal"],["phase","Retrato de fase"],["both","Vista dual"]].map(([k,lbl]) => (
+                      <button key={k} style={s.vTab(view===k)} onClick={() => setView(k)}>{lbl}</button>
+                    ))}
+                  </div>
+                )}
+                {isRLC && (
+                  <div style={{fontFamily:"monospace",fontSize:"0.68rem",color:C.dim}}>
+                    Circuito RLC serie — EDO: L·q″ + R·q′ + q/C = Vs(t)
+                  </div>
+                )}
+                <LegendRow />
+              </div>
+
+              <div style={s.chartWrap}>
+                {!sol ? (
+                  <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:10,color:C.dim}}>
+                    <div style={{fontSize:"3rem",opacity:0.25}}>∿</div>
+                    <div style={{fontFamily:"monospace",fontSize:"0.8rem"}}>
+                      {isRLC ? "Configura R, L, C y presiona SIMULAR" : "Configura el sistema y presiona SIMULAR"}
+                    </div>
+                  </div>
+                ) : isRLC ? (
+                  <RLCCharts/>
+                ) : view === "time" ? (
+                  <div style={{flex:1,padding:"10px 6px 2px"}}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={timeSeries}>
+                        <CartesianGrid {...gridStyle}/>
+                        <XAxis dataKey="t" stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toFixed(1)}
+                          label={{value:"t",position:"insideBottom",fill:C.dim,fontSize:10}}/>
+                        <YAxis stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toFixed(2)} width={56}/>
+                        <Tooltip content={<CustomTip lx={labels.lx} ly={labels.ly}/>}/>
+                        <Line type="monotone" dataKey="x" stroke={C.accent}  dot={false} strokeWidth={2} name={labels.lx}/>
+                        <Line type="monotone" dataKey="y" stroke={C.accent2} dot={false} strokeWidth={2} name={labels.ly}/>
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                ) : view === "phase" ? (
+                  <div style={{flex:1,padding:"10px 6px 2px"}}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ScatterChart>
+                        <CartesianGrid {...gridStyle}/>
+                        <XAxis dataKey="x" type="number" name={labels.lx} stroke={C.border} tick={axisStyle}
+                          tickFormatter={v=>Number(v).toFixed(2)} label={{value:labels.lx,position:"insideBottom",fill:C.dim,fontSize:10}}/>
+                        <YAxis dataKey="y" type="number" name={labels.ly} stroke={C.border} tick={axisStyle}
+                          tickFormatter={v=>Number(v).toFixed(2)} width={56} label={{value:labels.ly,angle:-90,position:"insideLeft",fill:C.dim,fontSize:10}}/>
+                        <Tooltip content={<PhaseTip lx={labels.lx} ly={labels.ly}/>}/>
+                        <Scatter data={phaseData} fill={C.accent} opacity={0.7}/>
+                      </ScatterChart>
+                    </ResponsiveContainer>
+                  </div>
+                ) : (
+                  <>
+                    <div style={{flex:1,padding:"10px 6px 2px",borderBottom:`1px solid ${C.border}`}}>
+                      <div style={{fontFamily:"monospace",fontSize:"0.58rem",color:C.dim,paddingLeft:6,marginBottom:2}}>SERIE TEMPORAL</div>
+                      <ResponsiveContainer width="100%" height="calc(100% - 18px)">
+                        <LineChart data={timeSeries}>
+                          <CartesianGrid {...gridStyle}/>
+                          <XAxis dataKey="t" stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toFixed(1)}/>
+                          <YAxis stroke={C.border} tick={axisStyle} tickFormatter={v=>Number(v).toFixed(1)} width={50}/>
+                          <Tooltip content={<CustomTip lx={labels.lx} ly={labels.ly}/>}/>
+                          <Line type="monotone" dataKey="x" stroke={C.accent}  dot={false} strokeWidth={1.5}/>
+                          <Line type="monotone" dataKey="y" stroke={C.accent2} dot={false} strokeWidth={1.5}/>
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <div style={{flex:1,padding:"6px 6px 2px"}}>
+                      <div style={{fontFamily:"monospace",fontSize:"0.58rem",color:C.dim,paddingLeft:6,marginBottom:2}}>RETRATO DE FASE</div>
+                      <ResponsiveContainer width="100%" height="calc(100% - 18px)">
+                        <ScatterChart>
+                          <CartesianGrid {...gridStyle}/>
+                          <XAxis dataKey="x" type="number" stroke={C.border} tick={axisStyle}
+                            tickFormatter={v=>Number(v).toFixed(1)} label={{value:labels.lx,position:"insideBottom",fill:C.dim,fontSize:9}}/>
+                          <YAxis dataKey="y" type="number" stroke={C.border} tick={axisStyle}
+                            tickFormatter={v=>Number(v).toFixed(1)} width={50} label={{value:labels.ly,angle:-90,position:"insideLeft",fill:C.dim,fontSize:9}}/>
+                          <Tooltip content={<PhaseTip lx={labels.lx} ly={labels.ly}/>}/>
+                          <Scatter data={phaseData} fill={C.purple} opacity={0.65}/>
+                        </ScatterChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div style={s.infoBar}>
+                <span>Método: <strong style={{color:C.text}}>{METHOD_LABELS[method].split("—")[0].trim()}</strong></span>
+                {isRLC && <span>Régimen: <strong style={{color:regime.color}}>{regime.label}</strong></span>}
+                {stats  && <span>Puntos: <strong style={{color:C.text}}>{stats.steps.toLocaleString()}</strong></span>}
+                {stats  && <span>CPU: <strong style={{color:C.text}}>{stats.ms} ms</strong></span>}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 4. Montar la app de React en el DOM ───────────────────────────────
+    const rootElement = document.getElementById('root');
+    const root = ReactDOM.createRoot(rootElement);
+    root.render(<SimEDO />);
+  </script>
+</body>
+</html>
